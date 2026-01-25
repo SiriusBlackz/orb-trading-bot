@@ -1,0 +1,31 @@
+[Unit]
+Description=ORB Trading Bot - Opening Range Breakout Strategy
+Documentation=https://github.com/SiriusBlackz/orb-trading-bot
+After=network.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/home/trader/orb-trading-bot
+Environment=PATH=/home/trader/orb-trading-bot/venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/trader/start-bot.sh
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=3
+StartLimitIntervalSec=300
+
+# Logging
+StandardOutput=append:/var/log/orb-bot/output.log
+StandardError=append:/var/log/orb-bot/error.log
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/trader/orb-trading-bot/logs
+ReadWritePaths=/home/trader/orb-trading-bot/data
+ReadWritePaths=/var/log/orb-bot
+
+[Install]
+WantedBy=multi-user.target
