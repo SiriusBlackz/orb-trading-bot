@@ -88,8 +88,8 @@ Thumbs.db
 *.log
 logs/
 
-# Data files
-data/
+# Data files (root level only, not src/data/)
+/data/
 *.csv
 *.parquet
 *.pkl
