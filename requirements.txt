@@ -1,6 +1,8 @@
 ib_insync
+alpaca-py
 pandas
 numpy
 python-dotenv
 loguru
 pytz
+pytest

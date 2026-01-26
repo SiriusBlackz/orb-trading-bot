@@ -25,12 +25,13 @@ class ORBSignal:
     direction: Direction
     entry_price: float
     stop_price: float
-    target_price: float
+    target_price: float | None  # None when use_eod_exit=True
     risk_per_share: float
     first_candle_open: float
     first_candle_high: float
     first_candle_low: float
     first_candle_close: float
+    use_eod_exit: bool = False  # If True, exit at EOD instead of target
 
 
 class ORBSignalGenerator:
@@ -40,8 +41,15 @@ class ORBSignalGenerator:
     SECOND_BAR = time(9, 35)
     REWARD_RISK_RATIO = 10
 
-    def __init__(self, symbol: str = "TSLA"):
+    def __init__(self, symbol: str = "TSLA", use_eod_exit: bool = False):
+        """Initialize signal generator.
+
+        Args:
+            symbol: Stock ticker symbol.
+            use_eod_exit: If True, skip target and only exit at EOD or stop loss.
+        """
         self.symbol = symbol
+        self.use_eod_exit = use_eod_exit
 
     def _get_first_candle(self, day_data: pd.DataFrame) -> pd.Series | None:
         """Get the 9:30 AM (market open) candle.
@@ -137,11 +145,17 @@ class ORBSignalGenerator:
         if direction == Direction.LONG:
             stop_price = first_candle["low"]
             risk_per_share = entry_price - stop_price
-            target_price = entry_price + (self.REWARD_RISK_RATIO * risk_per_share)
+            if self.use_eod_exit:
+                target_price = None
+            else:
+                target_price = entry_price + (self.REWARD_RISK_RATIO * risk_per_share)
         else:  # SHORT
             stop_price = first_candle["high"]
             risk_per_share = stop_price - entry_price
-            target_price = entry_price - (self.REWARD_RISK_RATIO * risk_per_share)
+            if self.use_eod_exit:
+                target_price = None
+            else:
+                target_price = entry_price - (self.REWARD_RISK_RATIO * risk_per_share)
 
         # Validate risk is positive
         if risk_per_share <= 0:
@@ -160,11 +174,13 @@ class ORBSignalGenerator:
             first_candle_high=first_candle["high"],
             first_candle_low=first_candle["low"],
             first_candle_close=first_candle["close"],
+            use_eod_exit=self.use_eod_exit,
         )
 
+        target_str = "EOD" if self.use_eod_exit else f"{target_price:.2f}"
         logger.info(
             f"Signal: {direction.value} {self.symbol} @ {entry_price:.2f}, "
-            f"stop={stop_price:.2f}, target={target_price:.2f}, risk={risk_per_share:.2f}"
+            f"stop={stop_price:.2f}, target={target_str}, risk={risk_per_share:.2f}"
         )
 
         return signal

@@ -58,10 +58,17 @@ class BacktestResult:
 class ORBBacktester:
     """Backtests the Opening Range Breakout strategy."""
 
-    def __init__(self, initial_capital: float = None, risk_per_trade: float = None, max_leverage: float = None):
+    def __init__(
+        self,
+        initial_capital: float = None,
+        risk_per_trade: float = None,
+        max_leverage: float = None,
+        use_eod_exit: bool = False,
+    ):
         self.initial_capital = initial_capital or float(os.getenv("STARTING_CAPITAL", 25000))
         self.risk_per_trade = risk_per_trade or float(os.getenv("RISK_PER_TRADE", 0.01))
         self.max_leverage = max_leverage or float(os.getenv("MAX_LEVERAGE", 4))
+        self.use_eod_exit = use_eod_exit
 
     def calculate_position_size(self, account_value: float, entry_price: float, risk_per_share: float) -> int:
         """Calculate position size based on risk and leverage constraints.
@@ -143,8 +150,8 @@ class ORBBacktester:
                     exit_time = bar_datetime
                     exit_reason = "stop"
                     break
-                # Check target
-                elif bar_high >= signal.target_price:
+                # Check target (skip if use_eod_exit)
+                elif signal.target_price is not None and bar_high >= signal.target_price:
                     exit_price = signal.target_price
                     exit_time = bar_datetime
                     exit_reason = "target"
@@ -156,8 +163,8 @@ class ORBBacktester:
                     exit_time = bar_datetime
                     exit_reason = "stop"
                     break
-                # Check target
-                elif bar_low <= signal.target_price:
+                # Check target (skip if use_eod_exit)
+                elif signal.target_price is not None and bar_low <= signal.target_price:
                     exit_price = signal.target_price
                     exit_time = bar_datetime
                     exit_reason = "target"
@@ -217,10 +224,11 @@ class ORBBacktester:
         Returns:
             BacktestResult with all metrics.
         """
-        logger.info(f"Starting backtest for {symbol} with ${self.initial_capital:,.2f} initial capital")
+        exit_mode = "EOD-only" if self.use_eod_exit else "Target/Stop"
+        logger.info(f"Starting backtest for {symbol} with ${self.initial_capital:,.2f} initial capital ({exit_mode})")
 
         # Generate signals
-        signal_generator = ORBSignalGenerator(symbol=symbol)
+        signal_generator = ORBSignalGenerator(symbol=symbol, use_eod_exit=self.use_eod_exit)
         signals = signal_generator.generate_signals(df)
 
         if not signals:
