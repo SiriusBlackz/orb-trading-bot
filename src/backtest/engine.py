@@ -64,11 +64,13 @@ class ORBBacktester:
         risk_per_trade: float = None,
         max_leverage: float = None,
         use_eod_exit: bool = False,
+        profit_target_r: float = None,
     ):
         self.initial_capital = initial_capital or float(os.getenv("STARTING_CAPITAL", 25000))
         self.risk_per_trade = risk_per_trade or float(os.getenv("RISK_PER_TRADE", 0.01))
         self.max_leverage = max_leverage or float(os.getenv("MAX_LEVERAGE", 4))
         self.use_eod_exit = use_eod_exit
+        self.profit_target_r = profit_target_r or float(os.getenv("PROFIT_TARGET_R", 10))
 
     def calculate_position_size(self, account_value: float, entry_price: float, risk_per_share: float) -> int:
         """Calculate position size based on risk and leverage constraints.
@@ -228,7 +230,11 @@ class ORBBacktester:
         logger.info(f"Starting backtest for {symbol} with ${self.initial_capital:,.2f} initial capital ({exit_mode})")
 
         # Generate signals
-        signal_generator = ORBSignalGenerator(symbol=symbol, use_eod_exit=self.use_eod_exit)
+        signal_generator = ORBSignalGenerator(
+            symbol=symbol,
+            use_eod_exit=self.use_eod_exit,
+            profit_target_r=self.profit_target_r,
+        )
         signals = signal_generator.generate_signals(df)
 
         if not signals:

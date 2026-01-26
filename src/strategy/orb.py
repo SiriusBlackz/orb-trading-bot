@@ -1,11 +1,15 @@
 """Opening Range Breakout (ORB) strategy implementation."""
 
+import os
 from dataclasses import dataclass
 from datetime import datetime, time
 from enum import Enum
 
 import pandas as pd
+from dotenv import load_dotenv
 from loguru import logger
+
+load_dotenv()
 
 
 class Direction(Enum):
@@ -39,17 +43,23 @@ class ORBSignalGenerator:
 
     MARKET_OPEN = time(9, 30)
     SECOND_BAR = time(9, 35)
-    REWARD_RISK_RATIO = 10
 
-    def __init__(self, symbol: str = "TSLA", use_eod_exit: bool = False):
+    def __init__(
+        self,
+        symbol: str = "TSLA",
+        use_eod_exit: bool = False,
+        profit_target_r: float | None = None,
+    ):
         """Initialize signal generator.
 
         Args:
             symbol: Stock ticker symbol.
             use_eod_exit: If True, skip target and only exit at EOD or stop loss.
+            profit_target_r: Profit target as R multiple. Defaults to PROFIT_TARGET_R env var or 10.
         """
         self.symbol = symbol
         self.use_eod_exit = use_eod_exit
+        self.REWARD_RISK_RATIO = profit_target_r or float(os.getenv("PROFIT_TARGET_R", 10))
 
     def _get_first_candle(self, day_data: pd.DataFrame) -> pd.Series | None:
         """Get the 9:30 AM (market open) candle.
