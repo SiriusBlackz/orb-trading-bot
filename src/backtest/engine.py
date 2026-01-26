@@ -3,6 +3,7 @@
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -348,8 +349,50 @@ class ORBBacktester:
         )
 
 
+def _find_cached_alpaca_data(symbol: str, start_date: datetime, end_date: datetime) -> pd.DataFrame | None:
+    """Check for cached Alpaca data and filter to requested date range.
+
+    Args:
+        symbol: Stock symbol.
+        start_date: Requested start date.
+        end_date: Requested end date.
+
+    Returns:
+        DataFrame if cached data found with data in range, None otherwise.
+    """
+    data_dir = Path(__file__).parent.parent.parent / "data"
+    if not data_dir.exists():
+        return None
+
+    # Look for Alpaca cache files for this symbol
+    alpaca_files = list(data_dir.glob(f"{symbol}_*_alpaca.csv"))
+    if not alpaca_files:
+        logger.debug(f"No Alpaca cache files found for {symbol}")
+        return None
+
+    # Sort by filename (newest date range first)
+    for cache_file in sorted(alpaca_files, reverse=True):
+        logger.info(f"Checking Alpaca cache: {cache_file.name}")
+        try:
+            df = pd.read_csv(cache_file, parse_dates=["date"])
+
+            # Filter to requested date range
+            df = df[(df["date"].dt.date >= start_date.date()) & (df["date"].dt.date <= end_date.date())]
+
+            if not df.empty:
+                logger.success(f"Loaded {len(df)} bars from Alpaca cache ({cache_file.name})")
+                return df
+        except Exception as e:
+            logger.warning(f"Failed to load {cache_file.name}: {e}")
+            continue
+
+    return None
+
+
 def run_backtest(symbol: str, start_date: datetime, end_date: datetime) -> BacktestResult:
     """Fetch data and run backtest, printing results.
+
+    Checks for cached Alpaca data first, then falls back to IBKR.
 
     Args:
         symbol: Stock symbol to backtest.
@@ -359,12 +402,16 @@ def run_backtest(symbol: str, start_date: datetime, end_date: datetime) -> Backt
     Returns:
         BacktestResult with all metrics.
     """
-    from src.data.fetcher import fetch_and_cache_data
-
     logger.info(f"Running backtest for {symbol} from {start_date.date()} to {end_date.date()}")
 
-    # Fetch data
-    df = fetch_and_cache_data(symbol, start_date, end_date)
+    # First, check for cached Alpaca data
+    df = _find_cached_alpaca_data(symbol, start_date, end_date)
+
+    # Fall back to IBKR if no Alpaca cache found
+    if df is None or df.empty:
+        from src.data.fetcher import fetch_and_cache_data
+        logger.info("No cached Alpaca data found, fetching from IBKR...")
+        df = fetch_and_cache_data(symbol, start_date, end_date)
 
     if df.empty:
         logger.error("No data fetched, cannot run backtest")
