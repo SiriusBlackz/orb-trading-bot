@@ -1,9 +1,13 @@
 """Order execution for ORB trading strategy."""
 
+import json
 import os
 import sys
+import threading
+import time as time_module
 from datetime import datetime, time
 from pathlib import Path
+from typing import Any, Callable
 
 import pytz
 from dotenv import load_dotenv
@@ -15,27 +19,33 @@ from src.trading.monitor import ORBMonitor, TradeStatus
 
 load_dotenv()
 
+# Reconnection constants
+RECONNECT_DELAY = 5  # seconds
+MAX_RECONNECT_ATTEMPTS = 5
+
 # Eastern Time zone
 ET = pytz.timezone("America/New_York")
 
 # Project paths
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 LOGS_DIR = PROJECT_ROOT / "logs"
+ACTIVE_TRADE_FILE = LOGS_DIR / "active_trade.json"
 
-# Set up file logging for trades
+# Set up file logging for trades - comprehensive logging without filtering
 LOGS_DIR.mkdir(exist_ok=True)
 logger.add(
     LOGS_DIR / "trades.log",
-    rotation="1 day",
-    retention="30 days",
-    level="INFO",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
-    filter=lambda record: "trade" in record["extra"] or "order" in record["extra"],
+    rotation="10 MB",
+    retention="90 days",
+    level="DEBUG",
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {message}",
+    filter=lambda record: record["extra"].get("file_log", False),
+    backtrace=True,
+    diagnose=True,
 )
 
-# Create bound loggers
-trade_logger = logger.bind(trade=True)
-order_logger = logger.bind(order=True)
+# Create a file logger that logs to both console and file
+file_logger = logger.bind(file_log=True)
 
 
 class OrderExecutor:
@@ -63,6 +73,16 @@ class OrderExecutor:
         self._connected = False
         self._active_orders: dict[str, list[int]] = {}  # symbol -> order IDs
 
+        # Reconnection state
+        self._reconnect_attempts = 0
+        self._reconnecting = False
+        self._disconnect_callback: Callable[[], None] | None = None
+        self._reconnect_callback: Callable[[bool], None] | None = None  # bool = position_ok
+
+        # Register error handlers
+        self.ib.errorEvent += self._on_error
+        self.ib.disconnectedEvent += self._on_disconnected
+
     def connect(self) -> bool:
         """Connect to IBKR TWS/Gateway.
 
@@ -78,10 +98,14 @@ class OrderExecutor:
             logger.info(f"Connecting to IBKR ({mode}) at {self.host}:{self.port}")
             self.ib.connect(self.host, self.port, clientId=self.client_id)
             self._connected = True
-            logger.success(f"Connected to IBKR ({mode}) successfully")
+            self._reconnect_attempts = 0  # Reset on successful connect
+            file_logger.success(
+                f"IBKR_CONNECT | mode={mode} host={self.host} port={self.port} "
+                f"client_id={self.client_id}"
+            )
             return True
         except Exception as e:
-            logger.error(f"Failed to connect to IBKR: {e}")
+            file_logger.error(f"IBKR_CONNECT_ERROR | error={e} type={type(e).__name__}")
             return False
 
     def disconnect(self) -> None:
@@ -89,7 +113,157 @@ class OrderExecutor:
         if self._connected:
             self.ib.disconnect()
             self._connected = False
-            logger.info("Disconnected from IBKR")
+            file_logger.info("IBKR_DISCONNECT | status=disconnected")
+
+    def set_disconnect_callback(self, callback: Callable[[], None]) -> None:
+        """Set callback to be called on disconnect."""
+        self._disconnect_callback = callback
+
+    def set_reconnect_callback(self, callback: Callable[[bool], None]) -> None:
+        """Set callback to be called after successful reconnect.
+
+        Args:
+            callback: Function that takes a bool (True if position is intact).
+        """
+        self._reconnect_callback = callback
+
+    def _on_error(self, reqId: int, errorCode: int, errorString: str, contract) -> None:
+        """Handle IBKR error events.
+
+        Error codes:
+            1100: Connectivity lost
+            1101: Connectivity restored (data lost)
+            1102: Connectivity restored (data maintained)
+            2110: Connectivity between TWS and server is broken
+        """
+        if errorCode in (1100, 2110):
+            file_logger.error(
+                f"EXECUTOR_DISCONNECT | error_code={errorCode} message={errorString}"
+            )
+            self._connected = False
+            if not self._reconnecting:
+                self._handle_disconnect()
+        elif errorCode == 1101:
+            file_logger.warning(
+                f"EXECUTOR_RECONNECT | error_code={errorCode} message={errorString} data_lost=True"
+            )
+            self._connected = True
+            self._reconnecting = False
+            self._reconnect_attempts = 0
+            self._verify_and_notify()
+        elif errorCode == 1102:
+            file_logger.info(
+                f"EXECUTOR_RECONNECT | error_code={errorCode} message={errorString} data_maintained=True"
+            )
+            self._connected = True
+            self._reconnecting = False
+            self._reconnect_attempts = 0
+            self._verify_and_notify()
+        elif errorCode >= 2000:
+            # Warning codes - log but don't treat as disconnect
+            file_logger.warning(f"EXECUTOR_WARNING | code={errorCode} message={errorString}")
+
+    def _on_disconnected(self) -> None:
+        """Handle IB disconnected event."""
+        file_logger.warning("EXECUTOR_DISCONNECTED | Connection to IBKR lost")
+        self._connected = False
+        if not self._reconnecting:
+            self._handle_disconnect()
+
+    def _handle_disconnect(self) -> None:
+        """Handle disconnect and initiate reconnection."""
+        if self._reconnecting:
+            return
+
+        self._reconnecting = True
+
+        # Notify via callback
+        if self._disconnect_callback:
+            try:
+                self._disconnect_callback()
+            except Exception as e:
+                file_logger.error(f"DISCONNECT_CALLBACK_ERROR | error={e}")
+
+        # Start reconnection in a separate thread
+        reconnect_thread = threading.Thread(target=self._reconnect_loop, daemon=True)
+        reconnect_thread.start()
+
+    def _reconnect_loop(self) -> None:
+        """Attempt to reconnect with retries."""
+        while self._reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
+            self._reconnect_attempts += 1
+            file_logger.info(
+                f"EXECUTOR_RECONNECT_ATTEMPT | attempt={self._reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS} "
+                f"waiting={RECONNECT_DELAY}s"
+            )
+
+            time_module.sleep(RECONNECT_DELAY)
+
+            try:
+                # Create new IB instance
+                self.ib = IB()
+                self.ib.errorEvent += self._on_error
+                self.ib.disconnectedEvent += self._on_disconnected
+
+                mode = "PAPER" if self.paper_mode else "LIVE"
+                file_logger.info(
+                    f"EXECUTOR_RECONNECT | Attempting connection to {self.host}:{self.port} ({mode})"
+                )
+                self.ib.connect(self.host, self.port, clientId=self.client_id)
+                self._connected = True
+                self._reconnecting = False
+                self._reconnect_attempts = 0
+
+                file_logger.success(
+                    f"EXECUTOR_RECONNECT_SUCCESS | Connected after {self._reconnect_attempts} attempts"
+                )
+
+                # Verify position and notify
+                self._verify_and_notify()
+                return
+
+            except Exception as e:
+                file_logger.error(
+                    f"EXECUTOR_RECONNECT_FAILED | attempt={self._reconnect_attempts} error={e}"
+                )
+
+        # Max attempts reached
+        file_logger.error(
+            f"EXECUTOR_RECONNECT_EXHAUSTED | max_attempts={MAX_RECONNECT_ATTEMPTS} giving_up=True"
+        )
+        self._reconnecting = False
+
+    def _verify_and_notify(self) -> None:
+        """Verify position status after reconnect and notify via callback."""
+        position_ok = True
+
+        # Check if we have any tracked positions
+        for symbol in list(self._active_orders.keys()):
+            position = self.get_position(symbol)
+            open_orders = self.get_open_orders_for_symbol(symbol)
+
+            file_logger.info(
+                f"POSITION_VERIFY | symbol={symbol} position={position} "
+                f"open_orders={len(open_orders)}"
+            )
+
+            # If we have a position but no orders, something is wrong
+            if position != 0 and len(open_orders) == 0:
+                file_logger.warning(
+                    f"POSITION_UNPROTECTED | symbol={symbol} position={position} "
+                    f"no_stop_target=True"
+                )
+                position_ok = False
+
+        if self._reconnect_callback:
+            try:
+                self._reconnect_callback(position_ok)
+            except Exception as e:
+                file_logger.error(f"RECONNECT_CALLBACK_ERROR | error={e}")
+
+    def is_connected(self) -> bool:
+        """Check if connected to IBKR."""
+        return self._connected and self.ib.isConnected()
 
     def _create_bracket_order(
         self,
@@ -144,7 +318,7 @@ class OrderExecutor:
             List of order IDs if successful, None otherwise.
         """
         if not self._connected:
-            logger.error("Not connected to IBKR. Call connect() first.")
+            file_logger.error(f"ORDER_ERROR | symbol={signal.symbol} reason=not_connected")
             return None
 
         # Calculate position size
@@ -153,7 +327,11 @@ class OrderExecutor:
         )
 
         if quantity <= 0:
-            logger.warning(f"Position size is 0, cannot execute signal")
+            file_logger.warning(
+                f"ORDER_SKIP | symbol={signal.symbol} reason=position_size_zero "
+                f"account_value={account_value} entry_price={signal.entry_price} "
+                f"risk_per_share={signal.risk_per_share}"
+            )
             return None
 
         # Determine action
@@ -164,7 +342,9 @@ class OrderExecutor:
         try:
             self.ib.qualifyContracts(contract)
         except Exception as e:
-            logger.error(f"Failed to qualify contract for {signal.symbol}: {e}")
+            file_logger.error(
+                f"CONTRACT_ERROR | symbol={signal.symbol} error={e} type={type(e).__name__}"
+            )
             return None
 
         # Create bracket order
@@ -178,10 +358,11 @@ class OrderExecutor:
 
         # Place orders
         try:
-            order_logger.info(f"Placing {action} bracket order for {quantity} {signal.symbol}")
-            order_logger.info(f"  Entry: MARKET (target ~${signal.entry_price:.2f})")
-            order_logger.info(f"  Stop: ${signal.stop_price:.2f}")
-            order_logger.info(f"  Target: ${signal.target_price:.2f}")
+            file_logger.info(
+                f"ORDER_SUBMIT | symbol={signal.symbol} action={action} quantity={quantity} "
+                f"type=bracket entry_price=${signal.entry_price:.2f} "
+                f"stop_price=${signal.stop_price:.2f} target_price=${signal.target_price:.2f}"
+            )
 
             parent_trade = self.ib.placeOrder(contract, parent)
             stop_trade = self.ib.placeOrder(contract, stop)
@@ -190,17 +371,20 @@ class OrderExecutor:
             order_ids = [parent.orderId, stop.orderId, profit.orderId]
             self._active_orders[signal.symbol] = order_ids
 
-            order_logger.success(f"Bracket order placed. Order IDs: {order_ids}")
+            file_logger.success(
+                f"ORDER_ACCEPTED | symbol={signal.symbol} order_ids={order_ids} "
+                f"parent_id={parent.orderId} stop_id={stop.orderId} target_id={profit.orderId}"
+            )
 
             # Set up fill callback
-            parent_trade.filledEvent += lambda trade: self._on_fill(trade, "ENTRY")
-            stop_trade.filledEvent += lambda trade: self._on_fill(trade, "STOP")
-            profit_trade.filledEvent += lambda trade: self._on_fill(trade, "TARGET")
+            parent_trade.filledEvent += lambda trade: self._on_fill(trade, "ENTRY", signal.symbol)
+            stop_trade.filledEvent += lambda trade: self._on_fill(trade, "STOP", signal.symbol)
+            profit_trade.filledEvent += lambda trade: self._on_fill(trade, "TARGET", signal.symbol)
 
             return order_ids
 
         except Exception as e:
-            logger.error(f"Failed to place bracket order: {e}")
+            file_logger.error(f"ORDER_ERROR | symbol={signal.symbol} error={e} type={type(e).__name__}")
             return None
 
     def _calculate_position_size(
@@ -219,13 +403,16 @@ class OrderExecutor:
         shares = int(min(risk_based_shares, leverage_based_shares))
         return max(shares, 0)
 
-    def _on_fill(self, trade, fill_type: str) -> None:
+    def _on_fill(self, trade, fill_type: str, symbol: str = None) -> None:
         """Handle order fill events."""
         fill = trade.fills[-1] if trade.fills else None
         if fill:
-            trade_logger.info(
-                f"ORDER FILLED ({fill_type}): {trade.contract.symbol} "
-                f"{fill.execution.side} {fill.execution.shares} @ ${fill.execution.price:.2f}"
+            sym = symbol or trade.contract.symbol
+            file_logger.info(
+                f"FILL | symbol={sym} type={fill_type} side={fill.execution.side} "
+                f"shares={fill.execution.shares} price=${fill.execution.price:.2f} "
+                f"order_id={trade.order.orderId} exec_id={fill.execution.execId} "
+                f"time={fill.execution.time}"
             )
 
     def cancel_orders(self, order_ids: list[int]) -> bool:
@@ -238,7 +425,7 @@ class OrderExecutor:
             True if cancellation requests sent, False otherwise.
         """
         if not self._connected:
-            logger.error("Not connected to IBKR")
+            file_logger.error("ORDER_CANCEL_ERROR | reason=not_connected")
             return False
 
         try:
@@ -247,12 +434,15 @@ class OrderExecutor:
                 for trade in self.ib.openTrades():
                     if trade.order.orderId == order_id:
                         self.ib.cancelOrder(trade.order)
-                        order_logger.info(f"Cancelled order {order_id}")
+                        file_logger.info(
+                            f"ORDER_CANCEL | order_id={order_id} "
+                            f"symbol={trade.contract.symbol}"
+                        )
                         break
 
             return True
         except Exception as e:
-            logger.error(f"Failed to cancel orders: {e}")
+            file_logger.error(f"ORDER_CANCEL_ERROR | order_ids={order_ids} error={e}")
             return False
 
     def close_position(self, symbol: str) -> bool:
@@ -265,13 +455,13 @@ class OrderExecutor:
             True if position closed or no position, False on error.
         """
         if not self._connected:
-            logger.error("Not connected to IBKR")
+            file_logger.error(f"CLOSE_POSITION_ERROR | symbol={symbol} reason=not_connected")
             return False
 
         position = self.get_position(symbol)
 
         if position == 0:
-            logger.info(f"No open position in {symbol}")
+            file_logger.info(f"CLOSE_POSITION | symbol={symbol} position=0 action=none")
             return True
 
         # Cancel any active orders first
@@ -289,12 +479,15 @@ class OrderExecutor:
         order = MarketOrder(action, quantity)
 
         try:
-            order_logger.info(f"Closing position: {action} {quantity} {symbol}")
+            file_logger.info(
+                f"CLOSE_POSITION | symbol={symbol} action={action} "
+                f"quantity={quantity} type=market"
+            )
             trade = self.ib.placeOrder(contract, order)
-            trade.filledEvent += lambda t: self._on_fill(t, "CLOSE")
+            trade.filledEvent += lambda t: self._on_fill(t, "CLOSE", symbol)
             return True
         except Exception as e:
-            logger.error(f"Failed to close position: {e}")
+            file_logger.error(f"CLOSE_POSITION_ERROR | symbol={symbol} error={e}")
             return False
 
     def get_position(self, symbol: str) -> int:
@@ -331,6 +524,139 @@ class OrderExecutor:
         # Fallback to starting capital
         return float(os.getenv("STARTING_CAPITAL", 25000))
 
+    def get_open_orders_for_symbol(self, symbol: str) -> list[dict]:
+        """Get all open orders for a symbol.
+
+        Args:
+            symbol: Stock ticker symbol.
+
+        Returns:
+            List of order info dicts with order_id, order_type, action, quantity, price.
+        """
+        if not self._connected:
+            return []
+
+        orders = []
+        for trade in self.ib.openTrades():
+            if trade.contract.symbol == symbol:
+                order = trade.order
+                order_info = {
+                    "order_id": order.orderId,
+                    "order_type": order.orderType,
+                    "action": order.action,
+                    "quantity": int(order.totalQuantity),
+                }
+                # Add price based on order type
+                if order.orderType == "STP":
+                    order_info["price"] = order.auxPrice
+                elif order.orderType == "LMT":
+                    order_info["price"] = order.lmtPrice
+                orders.append(order_info)
+
+        return orders
+
+    def place_exit_orders(
+        self,
+        symbol: str,
+        position: int,
+        stop_price: float,
+        target_price: float,
+    ) -> list[int] | None:
+        """Place stop and target orders for an existing position.
+
+        Args:
+            symbol: Stock ticker symbol.
+            position: Current position size (positive=long, negative=short).
+            stop_price: Stop loss price.
+            target_price: Take profit price.
+
+        Returns:
+            List of order IDs [stop_id, target_id] if successful, None otherwise.
+        """
+        if not self._connected:
+            file_logger.error(f"EXIT_ORDER_ERROR | symbol={symbol} reason=not_connected")
+            return None
+
+        if position == 0:
+            file_logger.warning(f"EXIT_ORDER_SKIP | symbol={symbol} reason=no_position")
+            return None
+
+        # Create contract
+        contract = Stock(symbol, "SMART", "USD")
+        try:
+            self.ib.qualifyContracts(contract)
+        except Exception as e:
+            file_logger.error(f"CONTRACT_ERROR | symbol={symbol} error={e}")
+            return None
+
+        # Determine exit action based on position direction
+        quantity = abs(position)
+        exit_action = "SELL" if position > 0 else "BUY"
+
+        # Create stop loss order
+        stop = StopOrder(exit_action, quantity, stop_price)
+        stop.orderId = self.ib.client.getReqId()
+        stop.transmit = True
+
+        # Create take profit order
+        profit = LimitOrder(exit_action, quantity, target_price)
+        profit.orderId = self.ib.client.getReqId()
+        profit.transmit = True
+
+        try:
+            file_logger.info(
+                f"EXIT_ORDER_SUBMIT | symbol={symbol} action={exit_action} "
+                f"quantity={quantity} stop_price=${stop_price:.2f} "
+                f"target_price=${target_price:.2f}"
+            )
+
+            stop_trade = self.ib.placeOrder(contract, stop)
+            profit_trade = self.ib.placeOrder(contract, profit)
+
+            order_ids = [stop.orderId, profit.orderId]
+            self._active_orders[symbol] = order_ids
+
+            file_logger.success(
+                f"EXIT_ORDER_ACCEPTED | symbol={symbol} "
+                f"stop_id={stop.orderId} target_id={profit.orderId}"
+            )
+
+            # Set up fill callbacks
+            stop_trade.filledEvent += lambda trade: self._on_fill(trade, "STOP", symbol)
+            profit_trade.filledEvent += lambda trade: self._on_fill(trade, "TARGET", symbol)
+
+            return order_ids
+
+        except Exception as e:
+            file_logger.error(f"EXIT_ORDER_ERROR | symbol={symbol} error={e}")
+            return None
+
+    def get_current_price(self, symbol: str) -> float | None:
+        """Get current market price for a symbol.
+
+        Args:
+            symbol: Stock ticker symbol.
+
+        Returns:
+            Current price or None if unavailable.
+        """
+        if not self._connected:
+            return None
+
+        contract = Stock(symbol, "SMART", "USD")
+        try:
+            self.ib.qualifyContracts(contract)
+            ticker = self.ib.reqMktData(contract, "", False, False)
+            self.ib.sleep(1)  # Wait for data
+            price = ticker.marketPrice()
+            self.ib.cancelMktData(contract)
+            if price and price > 0:
+                return float(price)
+        except Exception as e:
+            file_logger.error(f"PRICE_ERROR | symbol={symbol} error={e}")
+
+        return None
+
 
 class PaperTrader:
     """Combines ORBMonitor and OrderExecutor for automated paper trading."""
@@ -354,10 +680,312 @@ class PaperTrader:
         self._order_ids: list[int] | None = None
         self._signal_executed = False
         self._position_closed = False
+        self._paused_for_reconnect = False
 
     def _now_et(self) -> datetime:
         """Get current time in Eastern Time."""
         return datetime.now(ET)
+
+    def _save_trade_state(
+        self,
+        entry_price: float,
+        stop_price: float,
+        target_price: float,
+        shares: int,
+        direction: str,
+        order_ids: list[int] | None = None,
+    ) -> None:
+        """Save active trade state to file for recovery.
+
+        Args:
+            entry_price: Entry price of the trade.
+            stop_price: Stop loss price.
+            target_price: Take profit price.
+            shares: Number of shares.
+            direction: 'LONG' or 'SHORT'.
+            order_ids: List of active order IDs.
+        """
+        state = {
+            "symbol": self.symbol,
+            "entry_price": entry_price,
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "shares": shares,
+            "direction": direction,
+            "order_ids": order_ids or [],
+            "opened_at": self._now_et().isoformat(),
+            "updated_at": self._now_et().isoformat(),
+        }
+        try:
+            with open(ACTIVE_TRADE_FILE, "w") as f:
+                json.dump(state, f, indent=2)
+            file_logger.info(
+                f"STATE_SAVE | symbol={self.symbol} entry=${entry_price:.2f} "
+                f"stop=${stop_price:.2f} target=${target_price:.2f} "
+                f"shares={shares} direction={direction}"
+            )
+        except Exception as e:
+            file_logger.error(f"STATE_SAVE_ERROR | error={e}")
+
+    def _load_trade_state(self) -> dict[str, Any] | None:
+        """Load trade state from file.
+
+        Returns:
+            Trade state dict or None if no state file exists.
+        """
+        if not ACTIVE_TRADE_FILE.exists():
+            return None
+
+        try:
+            with open(ACTIVE_TRADE_FILE, "r") as f:
+                state = json.load(f)
+
+            # Validate it's for the same symbol
+            if state.get("symbol") != self.symbol:
+                file_logger.warning(
+                    f"STATE_MISMATCH | file_symbol={state.get('symbol')} "
+                    f"current_symbol={self.symbol}"
+                )
+                return None
+
+            file_logger.info(
+                f"STATE_LOAD | symbol={state['symbol']} entry=${state['entry_price']:.2f} "
+                f"stop=${state['stop_price']:.2f} target=${state['target_price']:.2f} "
+                f"shares={state['shares']} direction={state['direction']} "
+                f"opened_at={state['opened_at']}"
+            )
+            return state
+
+        except Exception as e:
+            file_logger.error(f"STATE_LOAD_ERROR | error={e}")
+            return None
+
+    def _clear_trade_state(self) -> None:
+        """Delete the trade state file when trade is closed."""
+        if ACTIVE_TRADE_FILE.exists():
+            try:
+                ACTIVE_TRADE_FILE.unlink()
+                file_logger.info("STATE_CLEAR | trade state file deleted")
+            except Exception as e:
+                file_logger.error(f"STATE_CLEAR_ERROR | error={e}")
+
+    def check_existing_position(self) -> dict[str, Any] | None:
+        """Check for existing open position in IBKR.
+
+        Returns:
+            Position info dict with position, avg_cost, current_price, pnl
+            or None if no position.
+        """
+        position = self.executor.get_position(self.symbol)
+
+        if position == 0:
+            return None
+
+        # Get current price for P&L calculation
+        current_price = self.executor.get_current_price(self.symbol)
+
+        # Try to get average cost from IBKR positions
+        avg_cost = None
+        if self.executor._connected:
+            for pos in self.executor.ib.positions():
+                if pos.contract.symbol == self.symbol:
+                    avg_cost = float(pos.avgCost)
+                    break
+
+        # Calculate P&L if we have the data
+        unrealized_pnl = None
+        if current_price and avg_cost:
+            if position > 0:  # Long
+                unrealized_pnl = (current_price - avg_cost) * position
+            else:  # Short
+                unrealized_pnl = (avg_cost - current_price) * abs(position)
+
+        position_info = {
+            "position": position,
+            "direction": "LONG" if position > 0 else "SHORT",
+            "shares": abs(position),
+            "avg_cost": avg_cost,
+            "current_price": current_price,
+            "unrealized_pnl": unrealized_pnl,
+        }
+
+        file_logger.info(
+            f"EXISTING_POSITION | symbol={self.symbol} position={position} "
+            f"direction={position_info['direction']} shares={position_info['shares']} "
+            f"avg_cost=${avg_cost:.2f if avg_cost else 0:.2f} "
+            f"current_price=${current_price:.2f if current_price else 0:.2f} "
+            f"unrealized_pnl=${unrealized_pnl:.2f if unrealized_pnl else 0:.2f}"
+        )
+
+        return position_info
+
+    def _recover_position(self) -> bool:
+        """Attempt to recover an existing position on startup.
+
+        Returns:
+            True if position was recovered and managed, False otherwise.
+        """
+        # Check for existing position
+        position_info = self.check_existing_position()
+        if not position_info:
+            file_logger.info(f"RECOVERY | symbol={self.symbol} no existing position")
+            return False
+
+        file_logger.info("=" * 60)
+        file_logger.info(f"RECOVERY | Existing position detected for {self.symbol}")
+        file_logger.info("=" * 60)
+
+        # Load saved trade state
+        trade_state = self._load_trade_state()
+
+        if not trade_state:
+            file_logger.warning(
+                f"RECOVERY_WARNING | symbol={self.symbol} "
+                f"position exists but no trade state file found"
+            )
+            # We have a position but no state - can't safely manage it
+            return False
+
+        # Verify position matches state
+        if position_info["shares"] != trade_state["shares"]:
+            file_logger.warning(
+                f"RECOVERY_MISMATCH | state_shares={trade_state['shares']} "
+                f"actual_shares={position_info['shares']}"
+            )
+
+        # Check if stop/target orders are still active
+        open_orders = self.executor.get_open_orders_for_symbol(self.symbol)
+        has_stop = any(o["order_type"] == "STP" for o in open_orders)
+        has_target = any(o["order_type"] == "LMT" for o in open_orders)
+
+        file_logger.info(
+            f"RECOVERY_ORDERS | symbol={self.symbol} "
+            f"open_orders={len(open_orders)} has_stop={has_stop} has_target={has_target}"
+        )
+
+        # If missing stop or target, place new exit orders
+        if not has_stop or not has_target:
+            file_logger.info(
+                f"RECOVERY_REORDER | symbol={self.symbol} "
+                f"placing new exit orders stop=${trade_state['stop_price']:.2f} "
+                f"target=${trade_state['target_price']:.2f}"
+            )
+
+            # Cancel any remaining orders first
+            if open_orders:
+                order_ids = [o["order_id"] for o in open_orders]
+                self.executor.cancel_orders(order_ids)
+                self.executor.ib.sleep(0.5)  # Wait for cancellation
+
+            # Place new stop and target orders
+            order_ids = self.executor.place_exit_orders(
+                symbol=self.symbol,
+                position=position_info["position"],
+                stop_price=trade_state["stop_price"],
+                target_price=trade_state["target_price"],
+            )
+
+            if order_ids:
+                # Update state with new order IDs
+                self._save_trade_state(
+                    entry_price=trade_state["entry_price"],
+                    stop_price=trade_state["stop_price"],
+                    target_price=trade_state["target_price"],
+                    shares=position_info["shares"],
+                    direction=trade_state["direction"],
+                    order_ids=order_ids,
+                )
+                self._order_ids = order_ids
+            else:
+                file_logger.error(f"RECOVERY_ERROR | failed to place exit orders")
+                return False
+        else:
+            # Orders are active, just restore state
+            self._order_ids = [o["order_id"] for o in open_orders]
+            file_logger.info(
+                f"RECOVERY_SUCCESS | symbol={self.symbol} "
+                f"existing orders active order_ids={self._order_ids}"
+            )
+
+        # Mark that we have an active position
+        self._signal_executed = True
+
+        file_logger.success(
+            f"RECOVERY_COMPLETE | symbol={self.symbol} "
+            f"entry=${trade_state['entry_price']:.2f} "
+            f"stop=${trade_state['stop_price']:.2f} "
+            f"target=${trade_state['target_price']:.2f} "
+            f"current_pnl=${position_info['unrealized_pnl']:.2f if position_info['unrealized_pnl'] else 0:.2f}"
+        )
+
+        return True
+
+    def _on_executor_disconnect(self) -> None:
+        """Handle executor disconnect event."""
+        file_logger.warning(
+            f"DISCONNECT_HANDLER | symbol={self.symbol} pausing_operations=True"
+        )
+        self._paused_for_reconnect = True
+
+    def _on_executor_reconnect(self, position_ok: bool) -> None:
+        """Handle executor reconnect event.
+
+        Args:
+            position_ok: True if position and orders are intact.
+        """
+        file_logger.info(
+            f"RECONNECT_HANDLER | symbol={self.symbol} position_ok={position_ok}"
+        )
+
+        if not position_ok and self._signal_executed:
+            # Position exists but orders are missing - need to restore protection
+            trade_state = self._load_trade_state()
+            if trade_state:
+                position = self.executor.get_position(self.symbol)
+                if position != 0:
+                    file_logger.info(
+                        f"RECONNECT_RESTORE | symbol={self.symbol} "
+                        f"restoring stop/target orders"
+                    )
+                    order_ids = self.executor.place_exit_orders(
+                        symbol=self.symbol,
+                        position=position,
+                        stop_price=trade_state["stop_price"],
+                        target_price=trade_state["target_price"],
+                    )
+                    if order_ids:
+                        self._order_ids = order_ids
+                        self._save_trade_state(
+                            entry_price=trade_state["entry_price"],
+                            stop_price=trade_state["stop_price"],
+                            target_price=trade_state["target_price"],
+                            shares=abs(position),
+                            direction=trade_state["direction"],
+                            order_ids=order_ids,
+                        )
+                        file_logger.success(
+                            f"RECONNECT_RESTORE_SUCCESS | symbol={self.symbol} "
+                            f"order_ids={order_ids}"
+                        )
+                    else:
+                        file_logger.error(
+                            f"RECONNECT_RESTORE_FAILED | symbol={self.symbol}"
+                        )
+
+        self._paused_for_reconnect = False
+        file_logger.info(f"RECONNECT_HANDLER | symbol={self.symbol} resuming_operations=True")
+
+    def _on_data_disconnect(self) -> None:
+        """Handle data manager disconnect event."""
+        file_logger.warning(
+            f"DATA_DISCONNECT_HANDLER | symbol={self.symbol}"
+        )
+
+    def _on_data_reconnect(self) -> None:
+        """Handle data manager reconnect event."""
+        file_logger.info(
+            f"DATA_RECONNECT_HANDLER | symbol={self.symbol} data_feeds_restored=True"
+        )
 
     def _on_signal_generated(self) -> None:
         """Called when ORB signal is generated at 9:35."""
@@ -365,26 +993,43 @@ class PaperTrader:
         if signal is None or self._signal_executed:
             return
 
-        trade_logger.info("=" * 60)
-        trade_logger.info("ORB SIGNAL DETECTED - EXECUTING TRADE")
-        trade_logger.info("=" * 60)
-        trade_logger.info(f"Symbol: {signal.symbol}")
-        trade_logger.info(f"Direction: {signal.direction.value}")
-        trade_logger.info(f"Entry: ${signal.entry_price:.2f}")
-        trade_logger.info(f"Stop: ${signal.stop_price:.2f}")
-        trade_logger.info(f"Target: ${signal.target_price:.2f}")
+        file_logger.info("=" * 60)
+        file_logger.info("SIGNAL | ORB signal generated")
+        file_logger.info("=" * 60)
+        file_logger.info(
+            f"SIGNAL | symbol={signal.symbol} direction={signal.direction.value} "
+            f"entry=${signal.entry_price:.2f} stop=${signal.stop_price:.2f} "
+            f"target=${signal.target_price:.2f} risk_per_share=${signal.risk_per_share:.2f}"
+        )
 
         # Get account value and execute
         account_value = self.executor.get_account_value()
-        trade_logger.info(f"Account Value: ${account_value:,.2f}")
+        file_logger.info(f"ACCOUNT | value=${account_value:,.2f}")
 
         self._order_ids = self.executor.execute_signal(signal, account_value)
 
         if self._order_ids:
             self._signal_executed = True
-            trade_logger.success(f"Trade executed successfully")
+            file_logger.success(
+                f"ORDER_PLACED | symbol={signal.symbol} direction={signal.direction.value} "
+                f"order_ids={self._order_ids} entry=${signal.entry_price:.2f} "
+                f"stop=${signal.stop_price:.2f} target=${signal.target_price:.2f}"
+            )
+            # Save trade state for recovery
+            # Calculate shares from position size formula
+            quantity = self.executor._calculate_position_size(
+                account_value, signal.entry_price, signal.risk_per_share
+            )
+            self._save_trade_state(
+                entry_price=signal.entry_price,
+                stop_price=signal.stop_price,
+                target_price=signal.target_price,
+                shares=quantity,
+                direction=signal.direction.value,
+                order_ids=self._order_ids,
+            )
         else:
-            trade_logger.error("Failed to execute trade")
+            file_logger.error(f"ORDER_FAILED | symbol={signal.symbol} reason=execute_signal_returned_none")
 
     def _check_eod_close(self) -> None:
         """Check if it's time to close positions for EOD."""
@@ -396,77 +1041,159 @@ class PaperTrader:
         if current_time >= self.EOD_CLOSE_TIME:
             position = self.executor.get_position(self.symbol)
             if position != 0:
-                trade_logger.info("EOD approaching - closing position")
+                file_logger.info(
+                    f"EOD_EXIT | symbol={self.symbol} position={position} "
+                    f"time={current_time} reason=end_of_day_close"
+                )
                 self.executor.close_position(self.symbol)
                 self._position_closed = True
+                self._clear_trade_state()
 
     def _monitor_loop(self) -> None:
         """Main monitoring loop."""
-        import time as time_module
+        last_position = 0
 
         while True:
-            # Let ib_insync process events
-            self.executor.ib.sleep(0.1)
-            self.monitor.data_manager.ib.sleep(0.1)
+            try:
+                # Let ib_insync process events
+                if self.executor.is_connected():
+                    self.executor.ib.sleep(0.1)
+                if self.monitor.data_manager.is_connected():
+                    self.monitor.data_manager.ib.sleep(0.1)
 
-            # Check if signal was generated
-            status = self.monitor.get_status()
-            if status == TradeStatus.SIGNAL_GENERATED and not self._signal_executed:
-                self._on_signal_generated()
+                # Skip operations if paused for reconnect
+                if self._paused_for_reconnect:
+                    time_module.sleep(0.5)
+                    continue
 
-            # Check for EOD close
-            if self._signal_executed:
-                self._check_eod_close()
+                # Check if signal was generated
+                status = self.monitor.get_status()
+                if status == TradeStatus.SIGNAL_GENERATED and not self._signal_executed:
+                    self._on_signal_generated()
 
-            # Check if trade is closed
-            if status == TradeStatus.TRADE_CLOSED:
-                trade_logger.info("Trade closed by stop/target")
-                break
+                # Monitor position changes
+                current_position = self.executor.get_position(self.symbol)
+                if current_position != last_position:
+                    file_logger.info(
+                        f"POSITION_CHANGE | symbol={self.symbol} "
+                        f"old_position={last_position} new_position={current_position}"
+                    )
+                    # If position went to zero, trade is closed
+                    if current_position == 0 and last_position != 0:
+                        self._clear_trade_state()
+                    last_position = current_position
 
-            # Check if market is closed
-            if not self.monitor._is_market_open() and self._now_et().time() > self.MARKET_CLOSE:
-                trade_logger.info("Market closed for the day")
-                break
+                # Check for EOD close
+                if self._signal_executed:
+                    self._check_eod_close()
 
-            time_module.sleep(0.5)
+                # Check if trade is closed
+                if status == TradeStatus.TRADE_CLOSED:
+                    file_logger.info(
+                        f"EXIT | symbol={self.symbol} reason=stop_or_target_hit "
+                        f"final_position={self.executor.get_position(self.symbol)}"
+                    )
+                    self._clear_trade_state()
+                    break
+
+                # Check if market is closed
+                if not self.monitor._is_market_open() and self._now_et().time() > self.MARKET_CLOSE:
+                    file_logger.info(f"MARKET_CLOSED | symbol={self.symbol} time={self._now_et().time()}")
+                    break
+
+                time_module.sleep(0.5)
+
+            except Exception as e:
+                file_logger.error(f"ERROR | symbol={self.symbol} error={e} type={type(e).__name__}")
+                raise
 
     def start(self) -> None:
         """Start the paper trader."""
         mode = "PAPER" if self.paper_mode else "LIVE"
-        trade_logger.info(f"Starting PaperTrader ({mode}) for {self.symbol}")
+        file_logger.info("=" * 60)
+        file_logger.info(
+            f"BOT_START | symbol={self.symbol} mode={mode} "
+            f"time={self._now_et().isoformat()} "
+            f"risk_per_trade={self.executor.risk_per_trade} "
+            f"max_leverage={self.executor.max_leverage}"
+        )
+        file_logger.info("=" * 60)
 
         # Connect executor
         if not self.executor.connect():
-            logger.error("Failed to connect executor to IBKR")
+            file_logger.error(f"ERROR | reason=executor_connection_failed symbol={self.symbol}")
             return
+
+        # Set up reconnection callbacks
+        self.executor.set_disconnect_callback(self._on_executor_disconnect)
+        self.executor.set_reconnect_callback(self._on_executor_reconnect)
+
+        file_logger.info(f"CONNECTION | executor connected to IBKR host={self.executor.host} port={self.executor.port}")
+
+        # Check for existing position and attempt recovery
+        if self._recover_position():
+            file_logger.info(f"RECOVERY | Resuming management of existing position")
+        else:
+            file_logger.info(f"RECOVERY | No existing position to recover")
 
         # Start monitor
         if not self.monitor.start():
-            logger.error("Failed to start monitor")
+            file_logger.error(f"ERROR | reason=monitor_start_failed symbol={self.symbol}")
             self.executor.disconnect()
             return
 
+        # Set up data manager reconnection callbacks
+        self.monitor.data_manager.set_disconnect_callback(self._on_data_disconnect)
+        self.monitor.data_manager.set_reconnect_callback(self._on_data_reconnect)
+
+        file_logger.info(f"MONITOR | started for {self.symbol}")
+
+        close_on_exit = True
         try:
             self._monitor_loop()
         except KeyboardInterrupt:
-            trade_logger.info("Paper trader interrupted")
+            file_logger.info(f"BOT_INTERRUPT | symbol={self.symbol} reason=keyboard_interrupt")
+            # Don't close position on keyboard interrupt - allow recovery on restart
+            close_on_exit = False
+        except Exception as e:
+            file_logger.error(f"ERROR | symbol={self.symbol} error={e} type={type(e).__name__}")
+            raise
         finally:
-            self.stop()
+            self.stop(close_position=close_on_exit)
 
-    def stop(self) -> None:
-        """Stop the paper trader and clean up."""
-        trade_logger.info("Stopping PaperTrader")
+    def stop(self, close_position: bool = True) -> None:
+        """Stop the paper trader and clean up.
 
-        # Close any open position
+        Args:
+            close_position: If True, close any open position. If False, keep
+                           position open for recovery on restart.
+        """
+        file_logger.info(f"BOT_STOPPING | symbol={self.symbol} time={self._now_et().isoformat()}")
+
+        # Close any open position if requested
         position = self.executor.get_position(self.symbol)
-        if position != 0:
-            trade_logger.info(f"Closing remaining position: {position} shares")
+        if position != 0 and close_position:
+            file_logger.info(
+                f"POSITION_CLOSE | symbol={self.symbol} position={position} "
+                f"reason=bot_shutdown"
+            )
             self.executor.close_position(self.symbol)
+            self._clear_trade_state()
+        elif position != 0:
+            file_logger.info(
+                f"POSITION_KEEP | symbol={self.symbol} position={position} "
+                f"reason=restart_recovery_enabled"
+            )
 
         self.monitor.stop()
         self.executor.disconnect()
 
-        trade_logger.info("PaperTrader stopped")
+        file_logger.info("=" * 60)
+        file_logger.info(
+            f"BOT_STOP | symbol={self.symbol} time={self._now_et().isoformat()} "
+            f"signal_executed={self._signal_executed} position_closed={self._position_closed}"
+        )
+        file_logger.info("=" * 60)
 
 
 if __name__ == "__main__":
@@ -505,8 +1232,8 @@ if __name__ == "__main__":
 
     def shutdown(signum, frame):
         """Handle shutdown signal."""
-        logger.info("Shutting down...")
-        trader.stop()
+        logger.info("Shutting down (keeping position for recovery)...")
+        trader.stop(close_position=False)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)

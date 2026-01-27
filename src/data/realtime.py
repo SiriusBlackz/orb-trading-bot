@@ -2,6 +2,7 @@
 
 import os
 import threading
+import time as time_module
 from collections import defaultdict
 from datetime import datetime, time
 from typing import Callable
@@ -12,6 +13,10 @@ from ib_insync import IB, Stock, util
 from loguru import logger
 
 load_dotenv()
+
+# Reconnection constants
+RECONNECT_DELAY = 5  # seconds
+MAX_RECONNECT_ATTEMPTS = 5
 
 
 class RealtimeDataManager:
@@ -25,10 +30,21 @@ class RealtimeDataManager:
 
         self._connected = False
         self._subscriptions: dict[str, any] = {}  # symbol -> bars object
+        self._subscription_config: dict[str, str] = {}  # symbol -> bar_size (for resubscription)
         self._callbacks: dict[str, list[Callable]] = defaultdict(list)
         self._current_bars: dict[str, pd.Series] = {}
         self._bar_events: dict[str, threading.Event] = defaultdict(threading.Event)
         self._target_times: dict[str, datetime] = {}
+
+        # Reconnection state
+        self._reconnect_attempts = 0
+        self._reconnecting = False
+        self._disconnect_callback: Callable[[], None] | None = None
+        self._reconnect_callback: Callable[[], None] | None = None
+
+        # Register error handlers
+        self.ib.errorEvent += self._on_error
+        self.ib.disconnectedEvent += self._on_disconnected
 
     def connect(self) -> bool:
         """Connect to IBKR TWS/Gateway.
@@ -44,6 +60,7 @@ class RealtimeDataManager:
             logger.info(f"Connecting to IBKR at {self.host}:{self.port} (client_id={self.client_id})")
             self.ib.connect(self.host, self.port, clientId=self.client_id)
             self._connected = True
+            self._reconnect_attempts = 0  # Reset on successful connect
             logger.success("Connected to IBKR successfully")
             return True
         except Exception as e:
@@ -74,6 +91,189 @@ class RealtimeDataManager:
         self.ib.disconnect()
         self._connected = False
         logger.info("Disconnected from IBKR")
+
+    def set_disconnect_callback(self, callback: Callable[[], None]) -> None:
+        """Set callback to be called on disconnect."""
+        self._disconnect_callback = callback
+
+    def set_reconnect_callback(self, callback: Callable[[], None]) -> None:
+        """Set callback to be called after successful reconnect."""
+        self._reconnect_callback = callback
+
+    def _on_error(self, reqId: int, errorCode: int, errorString: str, contract) -> None:
+        """Handle IBKR error events.
+
+        Error codes:
+            1100: Connectivity lost
+            1101: Connectivity restored (data lost)
+            1102: Connectivity restored (data maintained)
+            2110: Connectivity between TWS and server is broken
+        """
+        if errorCode in (1100, 2110):
+            logger.error(
+                f"IBKR_DISCONNECT | error_code={errorCode} message={errorString}"
+            )
+            self._connected = False
+            if not self._reconnecting:
+                self._handle_disconnect()
+        elif errorCode == 1101:
+            logger.warning(
+                f"IBKR_RECONNECT | error_code={errorCode} message={errorString} data_lost=True"
+            )
+            self._connected = True
+            self._reconnecting = False
+            self._reconnect_attempts = 0
+            # Data was lost - need to resubscribe
+            self._resubscribe_all()
+            if self._reconnect_callback:
+                self._reconnect_callback()
+        elif errorCode == 1102:
+            logger.info(
+                f"IBKR_RECONNECT | error_code={errorCode} message={errorString} data_maintained=True"
+            )
+            self._connected = True
+            self._reconnecting = False
+            self._reconnect_attempts = 0
+            if self._reconnect_callback:
+                self._reconnect_callback()
+        elif errorCode >= 2000:
+            # Warning codes - log but don't treat as disconnect
+            logger.warning(f"IBKR_WARNING | code={errorCode} message={errorString}")
+
+    def _on_disconnected(self) -> None:
+        """Handle IB disconnected event."""
+        logger.warning("IBKR_DISCONNECTED | Connection to IBKR lost")
+        self._connected = False
+        if not self._reconnecting:
+            self._handle_disconnect()
+
+    def _handle_disconnect(self) -> None:
+        """Handle disconnect and initiate reconnection."""
+        if self._reconnecting:
+            return
+
+        self._reconnecting = True
+
+        # Notify via callback
+        if self._disconnect_callback:
+            try:
+                self._disconnect_callback()
+            except Exception as e:
+                logger.error(f"DISCONNECT_CALLBACK_ERROR | error={e}")
+
+        # Start reconnection in a separate thread to not block
+        reconnect_thread = threading.Thread(target=self._reconnect_loop, daemon=True)
+        reconnect_thread.start()
+
+    def _reconnect_loop(self) -> None:
+        """Attempt to reconnect with retries."""
+        while self._reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
+            self._reconnect_attempts += 1
+            logger.info(
+                f"RECONNECT_ATTEMPT | attempt={self._reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS} "
+                f"waiting={RECONNECT_DELAY}s"
+            )
+
+            time_module.sleep(RECONNECT_DELAY)
+
+            try:
+                # Create new IB instance
+                self.ib = IB()
+                self.ib.errorEvent += self._on_error
+                self.ib.disconnectedEvent += self._on_disconnected
+
+                logger.info(f"RECONNECT | Attempting connection to {self.host}:{self.port}")
+                self.ib.connect(self.host, self.port, clientId=self.client_id)
+                self._connected = True
+                self._reconnecting = False
+                self._reconnect_attempts = 0
+
+                logger.success(
+                    f"RECONNECT_SUCCESS | Connected after {self._reconnect_attempts} attempts"
+                )
+
+                # Resubscribe to all data feeds
+                self._resubscribe_all()
+
+                # Notify via callback
+                if self._reconnect_callback:
+                    try:
+                        self._reconnect_callback()
+                    except Exception as e:
+                        logger.error(f"RECONNECT_CALLBACK_ERROR | error={e}")
+
+                return
+
+            except Exception as e:
+                logger.error(
+                    f"RECONNECT_FAILED | attempt={self._reconnect_attempts} error={e}"
+                )
+
+        # Max attempts reached
+        logger.error(
+            f"RECONNECT_EXHAUSTED | max_attempts={MAX_RECONNECT_ATTEMPTS} giving_up=True"
+        )
+        self._reconnecting = False
+
+    def _resubscribe_all(self) -> None:
+        """Resubscribe to all previously subscribed data feeds."""
+        if not self._subscription_config:
+            logger.info("RESUBSCRIBE | No subscriptions to restore")
+            return
+
+        logger.info(f"RESUBSCRIBE | Restoring {len(self._subscription_config)} subscriptions")
+
+        # Store old config and clear subscriptions
+        old_config = self._subscription_config.copy()
+        old_callbacks = {sym: cbs.copy() for sym, cbs in self._callbacks.items()}
+        self._subscriptions.clear()
+
+        for symbol, bar_size in old_config.items():
+            try:
+                # Resubscribe without callbacks first
+                contract = Stock(symbol, "SMART", "USD")
+                self.ib.qualifyContracts(contract)
+
+                bars = self.ib.reqHistoricalData(
+                    contract,
+                    endDateTime="",
+                    durationStr="1 D",
+                    barSizeSetting=bar_size,
+                    whatToShow="TRADES",
+                    useRTH=True,
+                    formatDate=1,
+                    keepUpToDate=True,
+                )
+
+                bars.updateEvent += self._on_bar_update
+                self._subscriptions[symbol] = bars
+
+                # Restore callbacks
+                if symbol in old_callbacks:
+                    self._callbacks[symbol] = old_callbacks[symbol]
+
+                # Update current bar
+                if bars:
+                    latest = bars[-1]
+                    self._current_bars[symbol] = pd.Series({
+                        "date": latest.date,
+                        "open": latest.open,
+                        "high": latest.high,
+                        "low": latest.low,
+                        "close": latest.close,
+                        "volume": latest.volume,
+                        "average": getattr(latest, "average", None),
+                        "barCount": getattr(latest, "barCount", None),
+                    })
+
+                logger.success(f"RESUBSCRIBE | Restored {symbol} {bar_size}")
+
+            except Exception as e:
+                logger.error(f"RESUBSCRIBE_ERROR | symbol={symbol} error={e}")
+
+    def is_connected(self) -> bool:
+        """Check if connected to IBKR."""
+        return self._connected and self.ib.isConnected()
 
     def _on_bar_update(self, bars, has_new_bar: bool) -> None:
         """Handle incoming bar updates.
@@ -176,6 +376,7 @@ class RealtimeDataManager:
             bars.updateEvent += self._on_bar_update
 
             self._subscriptions[symbol] = bars
+            self._subscription_config[symbol] = bar_size  # Store for resubscription
 
             if callback:
                 self._callbacks[symbol].append(callback)
