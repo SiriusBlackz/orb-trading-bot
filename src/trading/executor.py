@@ -1271,6 +1271,12 @@ class MultiSymbolPaperTrader:
             symbol: Stock ticker symbol.
             client_id_offset: Unique client ID offset for this symbol's connections.
         """
+        import asyncio
+
+        # Create and set a new event loop for this thread (required by ib_insync)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         try:
             trader = PaperTrader(
                 symbol=symbol,
@@ -1287,6 +1293,7 @@ class MultiSymbolPaperTrader:
             file_logger.error(f"THREAD_ERROR | symbol={symbol} error={e} type={type(e).__name__}")
         finally:
             file_logger.info(f"THREAD_END | symbol={symbol}")
+            loop.close()
 
     def start(self) -> None:
         """Start all symbol traders in separate threads."""
