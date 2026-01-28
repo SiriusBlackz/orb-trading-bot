@@ -22,11 +22,16 @@ MAX_RECONNECT_ATTEMPTS = 5
 class RealtimeDataManager:
     """Manages real-time market data subscriptions from IBKR."""
 
-    def __init__(self):
+    def __init__(self, client_id_offset: int = 0):
+        """Initialize the data manager.
+
+        Args:
+            client_id_offset: Offset to add to base client ID for unique connections.
+        """
         self.ib = IB()
         self.host = os.getenv("IBKR_HOST", "127.0.0.1")
         self.port = int(os.getenv("IBKR_PORT", 7497))
-        self.client_id = int(os.getenv("IBKR_CLIENT_ID", 1))
+        self.client_id = int(os.getenv("IBKR_CLIENT_ID", 1)) + client_id_offset
 
         self._connected = False
         self._subscriptions: dict[str, any] = {}  # symbol -> bars object

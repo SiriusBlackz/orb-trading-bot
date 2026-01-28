@@ -36,9 +36,15 @@ class ORBMonitor:
     FIRST_CANDLE_END = time(9, 35)
     MARKET_CLOSE = time(16, 0)
 
-    def __init__(self, symbol: str = None):
+    def __init__(self, symbol: str = None, client_id_offset: int = 0):
+        """Initialize the ORB monitor.
+
+        Args:
+            symbol: Stock ticker symbol.
+            client_id_offset: Offset to add to base client ID for unique connections.
+        """
         self.symbol = symbol or os.getenv("SYMBOL", "TSLA")
-        self.data_manager = RealtimeDataManager()
+        self.data_manager = RealtimeDataManager(client_id_offset=client_id_offset)
         self.signal_generator = ORBSignalGenerator(symbol=self.symbol)
 
         # State variables

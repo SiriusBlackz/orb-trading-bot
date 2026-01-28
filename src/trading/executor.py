@@ -29,7 +29,22 @@ ET = pytz.timezone("America/New_York")
 # Project paths
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 LOGS_DIR = PROJECT_ROOT / "logs"
-ACTIVE_TRADE_FILE = LOGS_DIR / "active_trade.json"
+ACTIVE_TRADES_FILE = LOGS_DIR / "active_trades.json"  # Stores multiple trades by symbol
+
+
+def get_symbols_from_env() -> list[str]:
+    """Parse SYMBOLS from environment variable.
+
+    Returns:
+        List of symbols from SYMBOLS env var (comma-separated) or single SYMBOL.
+    """
+    symbols_str = os.getenv("SYMBOLS", "")
+    if symbols_str:
+        return [s.strip().upper() for s in symbols_str.split(",") if s.strip()]
+
+    # Fallback to single SYMBOL for backwards compatibility
+    single = os.getenv("SYMBOL", "TSLA")
+    return [single.upper()]
 
 # Set up file logging for trades - comprehensive logging without filtering
 LOGS_DIR.mkdir(exist_ok=True)
@@ -51,12 +66,13 @@ file_logger = logger.bind(file_log=True)
 class OrderExecutor:
     """Executes orders through IBKR TWS."""
 
-    def __init__(self, paper_mode: bool = True):
+    def __init__(self, paper_mode: bool = True, client_id_offset: int = 0):
         """Initialize order executor.
 
         Args:
             paper_mode: If True, connect to paper trading port (7497).
                        If False, connect to live trading port (7496).
+            client_id_offset: Offset to add to base client ID for unique connections.
         """
         self.paper_mode = paper_mode
         self.ib = IB()
@@ -65,7 +81,8 @@ class OrderExecutor:
         # Paper trading uses 7497, live uses 7496
         default_port = 7497 if paper_mode else 7496
         self.port = int(os.getenv("IBKR_PORT", default_port))
-        self.client_id = int(os.getenv("IBKR_CLIENT_ID", 1)) + 10  # Different client ID from data
+        # Add 10 to separate from data connections, plus symbol-specific offset
+        self.client_id = int(os.getenv("IBKR_CLIENT_ID", 1)) + 10 + client_id_offset
 
         self.risk_per_trade = float(os.getenv("RISK_PER_TRADE", 0.01))
         self.max_leverage = float(os.getenv("MAX_LEVERAGE", 4))
@@ -664,18 +681,22 @@ class PaperTrader:
     MARKET_CLOSE = time(16, 0)
     EOD_CLOSE_TIME = time(15, 55)  # Close positions 5 min before market close
 
-    def __init__(self, symbol: str = None, paper_mode: bool = True):
+    def __init__(self, symbol: str = None, paper_mode: bool = True, client_id_offset: int = 0):
         """Initialize paper trader.
 
         Args:
             symbol: Stock ticker symbol.
             paper_mode: If True, use paper trading.
+            client_id_offset: Offset to add to base client IDs for unique connections.
+                             Each PaperTrader uses 2 client IDs (data + executor).
         """
         self.symbol = symbol or os.getenv("SYMBOL", "TSLA")
         self.paper_mode = paper_mode
 
-        self.monitor = ORBMonitor(symbol=self.symbol)
-        self.executor = OrderExecutor(paper_mode=paper_mode)
+        # Each PaperTrader uses 2 client IDs: one for data, one for executor
+        # Data manager uses offset, executor uses offset (plus its internal +10)
+        self.monitor = ORBMonitor(symbol=self.symbol, client_id_offset=client_id_offset)
+        self.executor = OrderExecutor(paper_mode=paper_mode, client_id_offset=client_id_offset)
 
         self._order_ids: list[int] | None = None
         self._signal_executed = False
@@ -705,7 +726,7 @@ class PaperTrader:
             direction: 'LONG' or 'SHORT'.
             order_ids: List of active order IDs.
         """
-        state = {
+        trade_data = {
             "symbol": self.symbol,
             "entry_price": entry_price,
             "stop_price": stop_price,
@@ -717,35 +738,41 @@ class PaperTrader:
             "updated_at": self._now_et().isoformat(),
         }
         try:
-            with open(ACTIVE_TRADE_FILE, "w") as f:
-                json.dump(state, f, indent=2)
+            # Load existing trades
+            all_trades = {}
+            if ACTIVE_TRADES_FILE.exists():
+                with open(ACTIVE_TRADES_FILE, "r") as f:
+                    all_trades = json.load(f)
+
+            # Update this symbol's trade
+            all_trades[self.symbol] = trade_data
+
+            with open(ACTIVE_TRADES_FILE, "w") as f:
+                json.dump(all_trades, f, indent=2)
             file_logger.info(
                 f"STATE_SAVE | symbol={self.symbol} entry=${entry_price:.2f} "
                 f"stop=${stop_price:.2f} target=${target_price:.2f} "
                 f"shares={shares} direction={direction}"
             )
         except Exception as e:
-            file_logger.error(f"STATE_SAVE_ERROR | error={e}")
+            file_logger.error(f"STATE_SAVE_ERROR | symbol={self.symbol} error={e}")
 
     def _load_trade_state(self) -> dict[str, Any] | None:
-        """Load trade state from file.
+        """Load trade state from file for this symbol.
 
         Returns:
-            Trade state dict or None if no state file exists.
+            Trade state dict or None if no state exists for this symbol.
         """
-        if not ACTIVE_TRADE_FILE.exists():
+        if not ACTIVE_TRADES_FILE.exists():
             return None
 
         try:
-            with open(ACTIVE_TRADE_FILE, "r") as f:
-                state = json.load(f)
+            with open(ACTIVE_TRADES_FILE, "r") as f:
+                all_trades = json.load(f)
 
-            # Validate it's for the same symbol
-            if state.get("symbol") != self.symbol:
-                file_logger.warning(
-                    f"STATE_MISMATCH | file_symbol={state.get('symbol')} "
-                    f"current_symbol={self.symbol}"
-                )
+            # Get this symbol's trade
+            state = all_trades.get(self.symbol)
+            if not state:
                 return None
 
             file_logger.info(
@@ -757,17 +784,32 @@ class PaperTrader:
             return state
 
         except Exception as e:
-            file_logger.error(f"STATE_LOAD_ERROR | error={e}")
+            file_logger.error(f"STATE_LOAD_ERROR | symbol={self.symbol} error={e}")
             return None
 
     def _clear_trade_state(self) -> None:
-        """Delete the trade state file when trade is closed."""
-        if ACTIVE_TRADE_FILE.exists():
-            try:
-                ACTIVE_TRADE_FILE.unlink()
-                file_logger.info("STATE_CLEAR | trade state file deleted")
-            except Exception as e:
-                file_logger.error(f"STATE_CLEAR_ERROR | error={e}")
+        """Remove this symbol's trade from the state file."""
+        if not ACTIVE_TRADES_FILE.exists():
+            return
+
+        try:
+            with open(ACTIVE_TRADES_FILE, "r") as f:
+                all_trades = json.load(f)
+
+            if self.symbol in all_trades:
+                del all_trades[self.symbol]
+                file_logger.info(f"STATE_CLEAR | symbol={self.symbol} removed from state file")
+
+                # Write back or delete file if empty
+                if all_trades:
+                    with open(ACTIVE_TRADES_FILE, "w") as f:
+                        json.dump(all_trades, f, indent=2)
+                else:
+                    ACTIVE_TRADES_FILE.unlink()
+                    file_logger.info("STATE_CLEAR | state file deleted (no active trades)")
+
+        except Exception as e:
+            file_logger.error(f"STATE_CLEAR_ERROR | symbol={self.symbol} error={e}")
 
     def check_existing_position(self) -> dict[str, Any] | None:
         """Check for existing open position in IBKR.
@@ -1196,44 +1238,187 @@ class PaperTrader:
         file_logger.info("=" * 60)
 
 
+class MultiSymbolPaperTrader:
+    """Manages multiple PaperTrader instances for multi-symbol trading.
+
+    Each symbol runs in its own thread with independent 1% risk allocation.
+    """
+
+    def __init__(self, symbols: list[str] = None, paper_mode: bool = True):
+        """Initialize multi-symbol paper trader.
+
+        Args:
+            symbols: List of stock ticker symbols.
+            paper_mode: If True, use paper trading.
+        """
+        self.symbols = symbols or get_symbols_from_env()
+        self.paper_mode = paper_mode
+
+        self._traders: dict[str, PaperTrader] = {}
+        self._threads: dict[str, threading.Thread] = {}
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+
+        file_logger.info(
+            f"MULTI_INIT | symbols={self.symbols} count={len(self.symbols)} "
+            f"mode={'PAPER' if paper_mode else 'LIVE'}"
+        )
+
+    def _run_symbol_trader(self, symbol: str, client_id_offset: int) -> None:
+        """Run a single symbol trader in a thread.
+
+        Args:
+            symbol: Stock ticker symbol.
+            client_id_offset: Unique client ID offset for this symbol's connections.
+        """
+        try:
+            trader = PaperTrader(
+                symbol=symbol,
+                paper_mode=self.paper_mode,
+                client_id_offset=client_id_offset,
+            )
+            with self._lock:
+                self._traders[symbol] = trader
+
+            file_logger.info(f"THREAD_START | symbol={symbol} client_id_offset={client_id_offset}")
+            trader.start()
+
+        except Exception as e:
+            file_logger.error(f"THREAD_ERROR | symbol={symbol} error={e} type={type(e).__name__}")
+        finally:
+            file_logger.info(f"THREAD_END | symbol={symbol}")
+
+    def start(self) -> None:
+        """Start all symbol traders in separate threads."""
+        mode = "PAPER" if self.paper_mode else "LIVE"
+        file_logger.info("=" * 60)
+        file_logger.info(
+            f"MULTI_START | symbols={self.symbols} mode={mode} "
+            f"time={datetime.now(ET).isoformat()}"
+        )
+        file_logger.info("=" * 60)
+
+        # Start a thread for each symbol with unique client ID offsets
+        # Each symbol needs 2 client IDs (data + executor), so offset by 2 per symbol
+        for i, symbol in enumerate(self.symbols):
+            client_id_offset = i * 2  # 0, 2, 4, 6, ... for each symbol
+            thread = threading.Thread(
+                target=self._run_symbol_trader,
+                args=(symbol, client_id_offset),
+                name=f"Trader-{symbol}",
+                daemon=True,
+            )
+            self._threads[symbol] = thread
+            thread.start()
+            file_logger.info(f"THREAD_LAUNCHED | symbol={symbol} client_id_offset={client_id_offset}")
+            # Small delay to stagger connections
+            time_module.sleep(1)
+
+        file_logger.info(f"MULTI_RUNNING | all {len(self.symbols)} threads started")
+
+        # Wait for all threads or stop event
+        try:
+            while not self._stop_event.is_set():
+                # Check if any threads are still alive
+                alive_threads = [s for s, t in self._threads.items() if t.is_alive()]
+                if not alive_threads:
+                    file_logger.info("MULTI_COMPLETE | all symbol threads finished")
+                    break
+                time_module.sleep(1)
+        except KeyboardInterrupt:
+            file_logger.info("MULTI_INTERRUPT | keyboard interrupt received")
+            self.stop(close_positions=False)
+
+    def stop(self, close_positions: bool = True) -> None:
+        """Stop all symbol traders.
+
+        Args:
+            close_positions: If True, close all open positions.
+        """
+        file_logger.info(f"MULTI_STOPPING | close_positions={close_positions}")
+        self._stop_event.set()
+
+        with self._lock:
+            for symbol, trader in self._traders.items():
+                try:
+                    file_logger.info(f"STOPPING | symbol={symbol}")
+                    trader.stop(close_position=close_positions)
+                except Exception as e:
+                    file_logger.error(f"STOP_ERROR | symbol={symbol} error={e}")
+
+        # Wait for threads to finish
+        for symbol, thread in self._threads.items():
+            if thread.is_alive():
+                thread.join(timeout=5)
+                if thread.is_alive():
+                    file_logger.warning(f"THREAD_TIMEOUT | symbol={symbol} did not stop gracefully")
+
+        file_logger.info("=" * 60)
+        file_logger.info(
+            f"MULTI_STOP | symbols={self.symbols} time={datetime.now(ET).isoformat()}"
+        )
+        file_logger.info("=" * 60)
+
+    def get_status(self) -> dict[str, dict]:
+        """Get status of all symbol traders.
+
+        Returns:
+            Dict mapping symbol to status info.
+        """
+        status = {}
+        with self._lock:
+            for symbol, trader in self._traders.items():
+                status[symbol] = {
+                    "thread_alive": self._threads[symbol].is_alive(),
+                    "signal_executed": trader._signal_executed,
+                    "position_closed": trader._position_closed,
+                    "paused": trader._paused_for_reconnect,
+                }
+        return status
+
+
 if __name__ == "__main__":
+    import argparse
     import signal
 
-    logger.info("Starting Order Executor / Paper Trader test")
+    parser = argparse.ArgumentParser(description="ORB Paper Trader")
+    parser.add_argument(
+        "--symbols",
+        type=str,
+        help="Comma-separated list of symbols (overrides SYMBOLS env var)",
+    )
+    parser.add_argument(
+        "--paper",
+        action="store_true",
+        default=True,
+        help="Use paper trading mode (default)",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Use live trading mode",
+    )
+    args = parser.parse_args()
 
-    symbol = os.getenv("SYMBOL", "TSLA")
-
-    # Test OrderExecutor connection and account info
-    logger.info("=" * 60)
-    logger.info("Testing OrderExecutor")
-    logger.info("=" * 60)
-
-    executor = OrderExecutor(paper_mode=True)
-
-    if executor.connect():
-        account_value = executor.get_account_value()
-        logger.info(f"Account Value: ${account_value:,.2f}")
-
-        position = executor.get_position(symbol)
-        logger.info(f"Current {symbol} Position: {position}")
-
-        executor.disconnect()
+    # Parse symbols
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     else:
-        logger.error("Could not connect to IBKR for executor test")
+        symbols = get_symbols_from_env()
 
-    # Test PaperTrader (comment out for quick test)
-    logger.info("=" * 60)
-    logger.info("Testing PaperTrader")
-    logger.info("=" * 60)
-    logger.info(f"Starting paper trader for {symbol}")
+    paper_mode = not args.live
+
+    mode_str = "PAPER" if paper_mode else "LIVE"
+    logger.info(f"Starting Multi-Symbol Paper Trader ({mode_str})")
+    logger.info(f"Symbols: {symbols}")
     logger.info("Press Ctrl+C to stop")
 
-    trader = PaperTrader(symbol=symbol, paper_mode=True)
+    trader = MultiSymbolPaperTrader(symbols=symbols, paper_mode=paper_mode)
 
     def shutdown(signum, frame):
         """Handle shutdown signal."""
-        logger.info("Shutting down (keeping position for recovery)...")
-        trader.stop(close_position=False)
+        logger.info("Shutting down (keeping positions for recovery)...")
+        trader.stop(close_positions=False)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
